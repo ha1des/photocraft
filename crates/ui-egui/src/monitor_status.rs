@@ -42,7 +42,12 @@ pub struct State {
     now: bool,
     /// When the last reading started (egui time).
     started: Option<f64>,
+    /// Whether any PhotoCraft window had the focus last frame (macOS reports focus per window:
+    /// the user can come back to a document window while the main window stays unfocused).
     focused: Option<bool>,
+    /// A document window had the focus this frame ([`check_window`]); counted at the next
+    /// [`poll`], which runs before the document windows are drawn.
+    window_focused: bool,
     /// Fallbacks already reported (display id, reason), so each is told once.
     reported: Vec<(u32, String)>,
 }
@@ -80,13 +85,12 @@ pub fn poll(app: &mut PhotocraftApp, ctx: &egui::Context) {
         app.session.color.main_display = main;
         ctx.request_repaint();
     }
-    let focused = ctx.input(|i| i.focused);
+    let focused = ctx.input(|i| i.focused) || std::mem::take(&mut app.monitors.window_focused);
     let regained = focused && app.monitors.focused == Some(false);
     app.monitors.focused = Some(focused);
-    if regained {
+    if regained || displays_changed(app, ctx) {
         app.monitors.again = true;
     }
-    check_window(app, ctx);
     if (app.monitors.again || app.monitors.now) && app.monitors.pending.is_none() {
         let now = ctx.input(|i| i.time);
         let wait = if app.monitors.now { 0.0 } else { app.monitors.started.map_or(0.0, |t| t + REREAD_SECS - now) };
@@ -102,11 +106,22 @@ pub fn poll(app: &mut PhotocraftApp, ctx: &egui::Context) {
     }
 }
 
-/// Is the window `ctx` draws on no known display, or on one whose size changed? Then read the
-/// displays again (called for the main window and every document window).
+/// A document window's part of [`poll`] (`ctx` draws it): its focus counts as PhotoCraft
+/// being in front, and a display it is on that the last reading didn't know (or whose size
+/// changed) asks for a new reading. Either wakes the main window, whose frame starts the read
+/// (r2: without that, nothing happens until other input arrives).
 pub fn check_window(app: &mut PhotocraftApp, ctx: &egui::Context) {
-    if displays_changed(app, ctx) {
+    let mut wake = false;
+    if ctx.input(|i| i.focused) {
+        app.monitors.window_focused = true;
+        wake |= app.monitors.focused == Some(false);
+    }
+    if displays_changed(app, ctx) && !app.monitors.again {
         app.monitors.again = true;
+        wake = true;
+    }
+    if wake {
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 }
 
@@ -370,21 +385,70 @@ mod tests {
         assert_eq!(app.session.color.monitor().description, "Display P3");
     }
 
-    #[test]
-    fn a_document_window_on_an_unknown_display_asks_for_a_reading() {
-        // r1 finding 1: a display connected while only a document window is on it.
-        let mut app = app();
-        let ctx = egui::Context::default();
-        app.session.color.set_displays(Ok(displays(p3())));
-        let reads = reader(&mut app, displays(p3()));
-        let mut input = egui::RawInput::default();
+    /// One frame of a document window at `pos` with `focused` (its part of the shell is
+    /// [`check_window`]); returns when the main window is asked to draw next.
+    fn doc_window(app: &mut PhotocraftApp, ctx: &egui::Context, pos: [f32; 2], focused: bool) -> std::time::Duration {
+        let mut input = egui::RawInput { focused, ..Default::default() };
         let vp = input.viewports.entry(egui::ViewportId::ROOT).or_default();
         vp.native_pixels_per_point = Some(1.0);
-        vp.outer_rect = Some(egui::Rect::from_min_size(egui::pos2(9000.0, 0.0), egui::vec2(800.0, 600.0)));
-        let mut out = ctx.run_ui(input, |ui| check_window(&mut app, ui.ctx()));
+        vp.outer_rect = Some(egui::Rect::from_min_size(egui::pos2(pos[0], pos[1]), egui::vec2(800.0, 600.0)));
+        vp.monitor_size = Some(egui::vec2(1728.0, 1117.0));
+        let mut out = ctx.run_ui(input, |ui| check_window(app, ui.ctx()));
         out.textures_delta.clear();
-        frame(&mut app, &ctx, 0.0, [100.0, 100.0], [1728.0, 1117.0], true);
+        out.viewport_output.get(&egui::ViewportId::ROOT).map_or(std::time::Duration::MAX, |v| v.repaint_delay)
+    }
+
+    #[test]
+    fn a_document_window_on_an_unknown_display_asks_for_a_reading() {
+        // r1 finding 1 / r2 finding 2: a display connected while only a document window is on
+        // it. The trigger must also wake the main window, whose frame starts the read.
+        let mut app = app();
+        let (main, doc) = (egui::Context::default(), egui::Context::default());
+        app.session.color.set_displays(Ok(displays(p3())));
+        let reads = reader(&mut app, displays(p3()));
+        frame(&mut app, &main, 100.0, [100.0, 100.0], [1728.0, 1117.0], true);
+        // A new egui context asks for a few frames of its own first.
+        for _ in 0..3 {
+            doc_window(&mut app, &doc, [100.0, 100.0], false);
+        }
+        assert_eq!(doc_window(&mut app, &doc, [100.0, 100.0], false), std::time::Duration::MAX, "nothing changed: no wake-up");
+        assert_eq!(doc_window(&mut app, &doc, [9000.0, 0.0], false), std::time::Duration::ZERO, "the main window is woken");
+        frame(&mut app, &main, 100.1, [100.0, 100.0], [1728.0, 1117.0], true);
         assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn coming_back_through_a_document_window_reads_again() {
+        // r2 finding 1: System Settings → back to a document window; the main window stays
+        // unfocused (macOS reports focus per window).
+        let mut app = app();
+        let (main, doc) = (egui::Context::default(), egui::Context::default());
+        app.session.color.set_displays(Ok(displays(p3())));
+        let reads = reader(&mut app, displays(p3()));
+        let count = || reads.load(std::sync::atomic::Ordering::SeqCst);
+        // Working in the document window: PhotoCraft is in front, no reading.
+        for _ in 0..3 {
+            doc_window(&mut app, &doc, [100.0, 100.0], true);
+        }
+        frame(&mut app, &main, 100.0, [100.0, 100.0], [1728.0, 1117.0], false);
+        doc_window(&mut app, &doc, [100.0, 100.0], true);
+        frame(&mut app, &main, 101.0, [100.0, 100.0], [1728.0, 1117.0], false);
+        assert_eq!(count(), 0);
+        // Another app in front: no PhotoCraft window has the focus.
+        doc_window(&mut app, &doc, [100.0, 100.0], false);
+        frame(&mut app, &main, 102.0, [100.0, 100.0], [1728.0, 1117.0], false);
+        frame(&mut app, &main, 150.0, [100.0, 100.0], [1728.0, 1117.0], false);
+        assert_eq!(count(), 0);
+        // Back to the document window: it wakes the main window, which reads.
+        assert_eq!(doc_window(&mut app, &doc, [100.0, 100.0], true), std::time::Duration::ZERO);
+        frame(&mut app, &main, 151.0, [100.0, 100.0], [1728.0, 1117.0], false);
+        assert_eq!(count(), 1);
+        // Staying there doesn't read again.
+        for t in 0..10 {
+            doc_window(&mut app, &doc, [100.0, 100.0], true);
+            frame(&mut app, &main, 152.0 + 10.0 * f64::from(t), [100.0, 100.0], [1728.0, 1117.0], false);
+        }
+        assert_eq!(count(), 1);
     }
 
     #[test]
