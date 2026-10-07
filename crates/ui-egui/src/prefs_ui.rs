@@ -550,7 +550,9 @@ pub fn invoke(app: &mut PhotocraftApp, _ctx: &egui::Context, id: &str, params: &
             let d = crate::filter_dialog::open(app, "edit.colorSettings");
             let cur = serde_json::to_value(&app.session.color.settings).unwrap_or_default();
             // What Monitor Profile resolves to now, so a fallback to sRGB is visible (#569).
-            let note = format!("Monitor profile in use: {}", app.session.color.monitor_status().summary());
+            let st = app.session.color.monitor_status();
+            let on = st.display.as_ref().map(|d| format!(" on {d}")).unwrap_or_default();
+            let note = format!("Monitor profile in use{on}: {}", st.summary());
             if let Some(dm) = d.and_then(|d| app.ui.dialog_mut(d)) {
                 for (k, v) in cur.as_object().into_iter().flatten() {
                     if dm.fields.contains_key(k) {

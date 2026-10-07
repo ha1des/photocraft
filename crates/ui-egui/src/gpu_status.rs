@@ -63,7 +63,7 @@ pub fn system_info(app: &PhotocraftApp) -> Vec<String> {
     let mut v =
         vec![format!("PhotoCraft {}", photocraft_engine::build_info::long_version()), format!("Platform: {} {}", std::env::consts::OS, std::env::consts::ARCH)];
     v.extend(app.perf.gpu_info.lines());
-    v.push(crate::monitor_status::summary(app));
+    v.extend(crate::monitor_status::summary_lines(app));
     v
 }
 
@@ -75,6 +75,7 @@ pub fn system_info_json(app: &PhotocraftApp) -> serde_json::Value {
         "arch": std::env::consts::ARCH,
         "gpu": app.perf.gpu_info,
         "monitor": app.session.color.monitor_status(),
+        "displays": app.session.color.display_statuses(),
         "lines": system_info(app),
     })
 }

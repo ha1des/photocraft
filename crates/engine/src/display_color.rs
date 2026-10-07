@@ -48,6 +48,10 @@ pub struct CanvasDisplay {
     pub transform: Option<Arc<Transform>>,
     /// Changes whenever any of the above changes (for UI caches).
     pub key: u64,
+    /// Changes whenever what the GPU canvas texture stores changes (`source`, `encode_srgb`),
+    /// but not with the monitor: the GPU canvas shares its texture between displays and only
+    /// the display LUT is per display.
+    pub texture_key: u64,
 }
 
 impl CanvasDisplay {
@@ -147,31 +151,52 @@ fn hash_of(v: impl std::hash::Hash) -> u64 {
     h.finish()
 }
 
-/// What the platform reported about the display's profile (Monitor Profile = `auto`; #569).
+/// What the platform reported about the displays' profiles (Monitor Profile = `auto`; #569).
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum MonitorDetection {
     /// No platform reader (web, Linux, Windows, tests).
     #[default]
     Unsupported,
-    /// Still being read.
+    /// Being read (the first time; a re-read keeps the previous displays meanwhile).
     Pending,
-    /// The reader ran but returned no usable profile.
+    /// The reader ran but returned no displays.
     Failed { reason: String },
-    /// Profile bytes (in [`ColorState::monitor_profile`]) read for this display.
-    Found { display: String },
+    /// [`ColorState::displays`] holds what it read.
+    Found,
 }
 
-/// A display profile read by the platform.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DetectedMonitor {
-    /// The display the profile belongs to (e.g. "Built-in Retina Display").
-    pub display: String,
-    pub icc: Vec<u8>,
+/// A display as the platform reports it.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Display {
+    /// Platform display id (macOS: `CGDirectDisplayID`).
+    pub id: u32,
+    /// E.g. "Built-in Retina Display".
+    pub name: String,
+    /// `[x, y, width, height]` in OS points; origin at the top-left of the primary display,
+    /// y down (the coordinates window positions use).
+    pub frame: [f64; 4],
+    /// The OS's name for the display's profile (System Settings), when known.
+    pub profile_name: Option<String>,
+    /// The display's ICC profile; `None` when the OS gave none.
+    #[serde(skip)]
+    pub icc: Option<Arc<Vec<u8>>>,
 }
 
-/// The monitor profile the canvas is actually shown in, and why (`edit.colorSettings`'s
-/// `monitorStatus`, Help › System Info).
+/// The display showing most of a window whose frame (OS points, as [`Display::frame`]) is
+/// `rect`: the one it overlaps most, as AppKit's `NSWindow.screen`. `None` when it overlaps none.
+pub fn display_at(displays: &[Display], rect: [f64; 4]) -> Option<u32> {
+    let area = |d: &Display| {
+        let w = (rect[0] + rect[2]).min(d.frame[0] + d.frame[2]) - rect[0].max(d.frame[0]);
+        let h = (rect[1] + rect[3]).min(d.frame[1] + d.frame[3]) - rect[1].max(d.frame[1]);
+        if w > 0.0 && h > 0.0 { w * h } else { 0.0 }
+    };
+    displays.iter().map(|d| (d.id, area(d))).filter(|(_, a)| *a > 0.0).max_by(|a, b| a.1.total_cmp(&b.1)).map(|(id, _)| id)
+}
+
+/// The monitor profile the canvas is actually shown in on one display, and why
+/// (`edit.colorSettings`'s `monitorStatus`, Help › System Info).
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MonitorStatus {
@@ -180,8 +205,12 @@ pub struct MonitorStatus {
     /// `auto` (the display's own profile), `manual` (the chosen profile) or `fallback` (sRGB,
     /// because the requested profile isn't available or usable: see `reason`).
     pub source: &'static str,
-    /// Description of the profile in use.
+    /// The display this is for (`auto` reads its profile), when known.
+    pub display: Option<String>,
+    /// Description of the profile in use (from the profile itself).
     pub profile: String,
+    /// The OS's name for it (`auto`), when known.
+    pub profile_name: Option<String>,
     /// Its content hash, to tell profiles with the same name apart.
     pub fingerprint: String,
     pub detection: MonitorDetection,
@@ -189,79 +218,126 @@ pub struct MonitorStatus {
 }
 
 impl MonitorStatus {
-    /// One line for Help › System Info and the Color Settings dialog.
+    /// One line for Help › System Info and the Color Settings dialog: the profile (by the OS's
+    /// name for it in `auto`), the source and any reason. The display is said by the caller.
     pub fn summary(&self) -> String {
-        let display = match &self.detection {
-            MonitorDetection::Found { display } if self.source == "auto" => format!(" for {display}"),
-            _ => String::new(),
+        let name = match (&self.profile_name, self.source) {
+            (Some(n), "auto") => n.as_str(),
+            _ => self.profile.as_str(),
         };
         match &self.reason {
-            Some(r) => format!("{} ({}: {r})", self.profile, self.source),
-            None => format!("{} ({}{display})", self.profile, self.source),
+            Some(r) => format!("{name} ({}: {r})", self.source),
+            None => format!("{name} ({})", self.source),
         }
     }
 }
 
-/// The resolved monitor profile and what it was resolved from (setting, platform bytes,
+/// A resolved monitor profile and what it was resolved from (setting, display, profile bytes,
 /// detection state).
-type MonitorCache = Option<(String, Option<Arc<Vec<u8>>>, MonitorDetection, Arc<Profile>, MonitorStatus)>;
+struct MonitorEntry {
+    spec: String,
+    display: Option<u32>,
+    icc: Option<Arc<Vec<u8>>>,
+    detection: MonitorDetection,
+    profile: Arc<Profile>,
+    status: MonitorStatus,
+}
 
-/// Caches of [`ColorState`] for the display (monitor profile and per-document displays).
+/// Caches of [`ColorState`] for the display (monitor profiles per display, per-document displays).
 #[derive(Default)]
 pub struct DisplayCaches {
-    monitor: Mutex<MonitorCache>,
+    monitor: Mutex<HashMap<Option<u32>, MonitorEntry>>,
     canvas: Mutex<HashMap<(ColorSpace, u64, u64), Arc<CanvasDisplay>>>,
 }
 
 impl ColorState {
-    /// The monitor profile: Color Settings › Monitor Profile (`auto`: the platform's profile when
-    /// supplied in [`ColorState::monitor_profile`], else sRGB). Profiles that are missing,
-    /// unreadable, not RGB or unusable as a display destination fall back to sRGB, and
-    /// [`ColorState::monitor_status`] says so.
+    /// The monitor profile of the main window's display ([`ColorState::main_display`]); see
+    /// [`ColorState::monitor_for`].
     pub fn monitor(&self) -> Arc<Profile> {
-        self.resolved_monitor().0
+        self.monitor_for(self.main_display)
+    }
+
+    /// The monitor profile for `display`: Color Settings › Monitor Profile (`auto`: that
+    /// display's profile as the platform reported it, the primary display's when `display` is
+    /// unknown, else sRGB). Profiles that are missing, unreadable, not RGB or unusable as a
+    /// display destination fall back to sRGB, and [`ColorState::monitor_status_for`] says so.
+    pub fn monitor_for(&self, display: Option<u32>) -> Arc<Profile> {
+        self.resolved_monitor(display).0
     }
 
     /// What [`ColorState::monitor`] resolved to, and why.
     pub fn monitor_status(&self) -> MonitorStatus {
-        self.resolved_monitor().1
+        self.monitor_status_for(self.main_display)
     }
 
-    /// Record the platform's display profile reading (`auto`).
-    pub fn set_detected_monitor(&mut self, r: std::result::Result<DetectedMonitor, String>) {
-        match r {
-            Ok(m) => {
-                self.monitor_profile = Some(Arc::new(m.icc));
-                self.monitor_detection = MonitorDetection::Found { display: m.display };
+    /// What [`ColorState::monitor_for`] resolved to, and why.
+    pub fn monitor_status_for(&self, display: Option<u32>) -> MonitorStatus {
+        self.resolved_monitor(display).1
+    }
+
+    /// Record the platform's reading of the displays (`auto`). An error keeps displays read
+    /// before (a failed re-read shouldn't undo a good one) and is returned for the log instead.
+    pub fn set_displays(&mut self, r: std::result::Result<Vec<Display>, String>) -> Option<String> {
+        let reason = match r {
+            Ok(d) if !d.is_empty() => {
+                self.displays = d;
+                self.monitor_detection = MonitorDetection::Found;
+                return None;
             }
-            Err(reason) => {
-                self.monitor_profile = None;
-                self.monitor_detection = MonitorDetection::Failed { reason };
-            }
+            Ok(_) => "the platform reported no displays".to_string(),
+            Err(reason) => reason,
+        };
+        if self.displays.is_empty() {
+            self.monitor_detection = MonitorDetection::Failed { reason };
+            None
+        } else {
+            Some(reason)
         }
     }
 
-    fn resolved_monitor(&self) -> (Arc<Profile>, MonitorStatus) {
+    /// Every display with what its monitor profile resolves to (Help › System Info).
+    pub fn display_statuses(&self) -> Vec<serde_json::Value> {
+        self.displays
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "id": d.id, "name": d.name, "frame": d.frame, "profileName": d.profile_name,
+                    "main": self.main_display == Some(d.id), "status": self.monitor_status_for(Some(d.id)),
+                })
+            })
+            .collect()
+    }
+
+    /// The display `id`, else the primary one (the first reported).
+    fn display_or_primary(&self, id: Option<u32>) -> Option<&Display> {
+        id.and_then(|id| self.displays.iter().find(|d| d.id == id)).or(self.displays.first())
+    }
+
+    fn resolved_monitor(&self, display: Option<u32>) -> (Arc<Profile>, MonitorStatus) {
         let spec = self.settings.monitor_profile.as_str();
+        let auto = spec.is_empty() || spec == "auto";
+        let shown = self.display_or_primary(display);
+        let icc = if auto { shown.and_then(|d| d.icc.clone()) } else { None };
         let mut cache = self.display.monitor.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((s, b, d, p, st)) = cache.as_ref()
-            && s == spec
-            && *d == self.monitor_detection
-            && match (b, &self.monitor_profile) {
+        if let Some(e) = cache.get(&display)
+            && e.spec == spec
+            && e.display == shown.map(|d| d.id)
+            && e.detection == self.monitor_detection
+            && match (&e.icc, &icc) {
                 (None, None) => true,
                 (Some(a), Some(b)) => Arc::ptr_eq(a, b),
                 _ => false,
             }
         {
-            return (p.clone(), st.clone());
+            return (e.profile.clone(), e.status.clone());
         }
-        let auto = spec.is_empty() || spec == "auto";
         let found = if auto {
-            match (&self.monitor_profile, &self.monitor_detection) {
-                (Some(b), _) => profile_from_bytes(b).map_err(|e| format!("the display profile can't be read: {e}")),
-                (None, MonitorDetection::Pending) => Err("the display profile hasn't been read yet".into()),
-                (None, MonitorDetection::Failed { reason }) => Err(reason.clone()),
-                (None, _) => Err("this platform doesn't report display profiles".into()),
+            match (shown, &icc, &self.monitor_detection) {
+                (_, Some(b), _) => profile_from_bytes(b).map_err(|e| format!("the display profile can't be read: {e}")),
+                (Some(d), None, _) => Err(format!("{} has no ICC profile", d.name)),
+                (None, None, MonitorDetection::Pending) => Err("the display profile hasn't been read yet".into()),
+                (None, None, MonitorDetection::Failed { reason }) => Err(reason.clone()),
+                (None, None, _) => Err("this platform doesn't report display profiles".into()),
             }
         } else {
             resolve_profile(spec, None, Some(photocraft_color::ColorMode::Rgb)).map_err(|e| e.to_string())
@@ -280,23 +356,42 @@ impl ColorState {
             Ok(p) => (p, if auto { "auto" } else { "manual" }, None),
             Err(r) => (Arc::new(Builtin::Srgb.profile().clone()), "fallback", Some(r)),
         };
-        let st = MonitorStatus {
+        let status = MonitorStatus {
             requested: if spec.is_empty() { "auto".into() } else { spec.to_string() },
             source,
+            display: shown.map(|d| d.name.clone()),
             profile: p.description.clone(),
+            profile_name: if auto { shown.and_then(|d| d.profile_name.clone()) } else { None },
             fingerprint: format!("{:016x}", p.content_hash()),
             detection: self.monitor_detection.clone(),
             reason,
         };
-        *cache = Some((spec.to_string(), self.monitor_profile.clone(), self.monitor_detection.clone(), p.clone(), st.clone()));
-        (p, st)
+        if cache.len() > 16 {
+            cache.clear();
+        }
+        let entry = MonitorEntry {
+            spec: spec.to_string(),
+            display: shown.map(|d| d.id),
+            icc,
+            detection: self.monitor_detection.clone(),
+            profile: p.clone(),
+            status: status.clone(),
+        };
+        cache.insert(display, entry);
+        (p, status)
     }
 
-    /// How the canvas shows `doc` (cached per document profile, mode and monitor profile).
+    /// How the canvas shows `doc` on the main window's display.
     pub fn canvas_display(&self, doc: &Document) -> Result<Arc<CanvasDisplay>> {
+        self.canvas_display_for(doc, self.main_display)
+    }
+
+    /// How the canvas shows `doc` on `display` (cached per document profile, mode and monitor
+    /// profile).
+    pub fn canvas_display_for(&self, doc: &Document, display: Option<u32>) -> Result<Arc<CanvasDisplay>> {
         let space = mode_space(doc.mode);
         let doc_hash = doc.icc_profile.as_ref().and_then(|b| profile_from_bytes(b).ok()).filter(|p| p.color_space == space).map_or(0, |p| p.content_hash());
-        let monitor = self.monitor();
+        let monitor = self.monitor_for(display);
         let key = (space, doc_hash, monitor.content_hash());
         if let Some(d) = self.display.canvas.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return Ok(d.clone());
@@ -313,6 +408,7 @@ impl ColorState {
         let d = Arc::new(CanvasDisplay {
             encode_srgb,
             key: hash_of((source.content_hash(), monitor.content_hash(), encode_srgb, transform.is_some())),
+            texture_key: hash_of((source.content_hash(), encode_srgb)),
             source,
             monitor,
             transform,
@@ -325,10 +421,15 @@ impl ColorState {
         Ok(d)
     }
 
-    /// Changes whenever the canvas display of `doc` changes: profiles, monitor, Proof Colors,
-    /// Gamut Warning and 32-bit preview settings (for the UI's LUT cache).
+    /// Changes whenever the canvas display of `doc` on the main window's display changes.
     pub fn display_signature(&self, doc: &Document) -> u64 {
-        let cm = self.canvas_display(doc).map(|d| d.key).unwrap_or(0);
+        self.display_signature_for(doc, self.main_display)
+    }
+
+    /// Changes whenever the canvas display of `doc` on `display` changes: profiles, monitor,
+    /// Proof Colors, Gamut Warning and 32-bit preview settings (for the UI's LUT cache).
+    pub fn display_signature_for(&self, doc: &Document, display: Option<u32>) -> u64 {
+        let cm = self.canvas_display_for(doc, display).map(|d| d.key).unwrap_or(0);
         // Per frame: read the proof state in place (the default state allocates a profile).
         let proof = self.proof_ref(doc.id).filter(|pv| pv.enabled || pv.gamut_warning).map(|pv| {
             let s = &pv.setup;
