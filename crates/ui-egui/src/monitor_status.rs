@@ -186,7 +186,7 @@ pub fn apply(app: &mut PhotocraftApp, r: Detection) {
         app.monitors.reported.push((id, reason.clone()));
         let on = if name.is_empty() { String::new() } else { format!(" on {name}") };
         let lines = vec![reason, format!("The canvas{on} is shown as sRGB. Choose a monitor profile in Edit › Color Settings.")];
-        crate::notices::post(app, FALLBACK_TITLE, lines, true);
+        crate::notices::post(app, FALLBACK_TITLE, lines, true, None);
     }
 }
 
