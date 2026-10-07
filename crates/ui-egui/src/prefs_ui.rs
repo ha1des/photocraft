@@ -549,10 +549,10 @@ pub fn invoke(app: &mut PhotocraftApp, _ctx: &egui::Context, id: &str, params: &
         "edit.colorSettings" => {
             let d = crate::filter_dialog::open(app, "edit.colorSettings");
             let cur = serde_json::to_value(&app.session.color.settings).unwrap_or_default();
-            // What Monitor Profile resolves to now, so a fallback to sRGB is visible (#569).
-            let st = app.session.color.monitor_status();
-            let on = st.display.as_ref().map(|d| format!(" on {d}")).unwrap_or_default();
-            let note = format!("Monitor profile in use{on}: {}", st.summary());
+            // What Monitor Profile resolves to, so a fallback to sRGB is visible (#569): read the
+            // displays again now, and the dialog refreshes this line as it draws.
+            crate::monitor_status::read_now(app);
+            let note = crate::monitor_status::note(app);
             if let Some(dm) = d.and_then(|d| app.ui.dialog_mut(d)) {
                 for (k, v) in cur.as_object().into_iter().flatten() {
                     if dm.fields.contains_key(k) {

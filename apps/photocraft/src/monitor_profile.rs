@@ -51,16 +51,61 @@ return out"#;
 
 #[cfg(target_os = "macos")]
 fn detect() -> Detection {
-    let out = std::process::Command::new("/usr/bin/osascript")
-        .args(["-e", SCRIPT])
-        .output()
-        .map_err(|e| format!("couldn't run osascript to read the display profiles: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+    let mut cmd = std::process::Command::new("/usr/bin/osascript");
+    cmd.args(["-e", SCRIPT]);
+    parse_reply(&run_helper(&mut cmd, HELPER_TIMEOUT)?)
+}
+
+/// How long a reading may take before the helper is stopped (it normally takes about 0.4 s).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run the helper and return its standard output; a helper that fails, or runs longer than
+/// `timeout`, is an error (and is killed and reaped), so a hung reading can't block later ones.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn run_helper(cmd: &mut std::process::Command, timeout: std::time::Duration) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child =
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("couldn't run the display profile reader: {e}"))?;
+    // Drain both pipes while waiting: a reply larger than the pipe buffer would otherwise block
+    // the helper until the deadline.
+    let drain = |p: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = p {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("reading the display profiles took longer than {} s and was stopped", timeout.as_secs()));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("waiting for the display profile reader failed: {e}"));
+            }
+        }
+    };
+    let out = out.join().unwrap_or_default();
+    let err = err.join().unwrap_or_default();
+    if !status.success() {
+        let err = String::from_utf8_lossy(&err);
         let first = err.lines().next().unwrap_or("").trim();
-        return Err(format!("reading the display profiles failed ({}){}", out.status, if first.is_empty() { String::new() } else { format!(": {first}") }));
+        return Err(format!("reading the display profiles failed ({status}){}", if first.is_empty() { String::new() } else { format!(": {first}") }));
     }
-    parse_reply(&String::from_utf8_lossy(&out.stdout))
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -166,6 +211,21 @@ mod tests {
         assert_eq!(parse_reply("junk\n5\t0\t0\t10\t10\t\t\tZ").unwrap().len(), 1);
         assert!(parse_reply("").is_err());
         assert!(parse_reply("execution error: -1728").unwrap_err().contains("-1728"));
+    }
+
+    #[test]
+    fn a_hung_helper_is_stopped_and_big_replies_dont_block() {
+        let t0 = std::time::Instant::now();
+        let e = run_helper(std::process::Command::new("/bin/sleep").arg("30"), std::time::Duration::from_millis(300)).unwrap_err();
+        assert!(e.contains("took longer than"), "{e}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "killed at the deadline");
+        // 1 MB on stdout (far beyond a pipe buffer) arrives whole.
+        let big = run_helper(std::process::Command::new("/bin/sh").args(["-c", "head -c 1048576 /dev/zero | tr '\\0' a"]), std::time::Duration::from_secs(20))
+            .unwrap();
+        assert_eq!(big.len(), 1 << 20);
+        let e = run_helper(std::process::Command::new("/bin/sh").args(["-c", "echo boom >&2; exit 3"]), std::time::Duration::from_secs(5)).unwrap_err();
+        assert!(e.contains("boom"), "{e}");
+        assert!(run_helper(&mut std::process::Command::new("/nonexistent/helper"), std::time::Duration::from_secs(1)).is_err());
     }
 
     fn base64_encode(b: &[u8]) -> String {

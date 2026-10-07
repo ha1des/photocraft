@@ -271,6 +271,13 @@ fn monitor_status_says_what_is_applied() {
     s.color.set_displays(Ok(vec![display(2, [0.0, 0.0, 100.0, 100.0], p3())]));
     assert_eq!(s.color.set_displays(Err("osascript failed".into())).as_deref(), Some("osascript failed"));
     assert_eq!((s.color.monitor().description.as_str(), s.color.displays.len()), ("Display P3", 1));
+    // ... and the status says the reading is an earlier one.
+    let st = status(&mut s);
+    assert_eq!((st["source"].as_str(), st["detection"]["state"].as_str()), (Some("auto"), Some("retained")));
+    assert_eq!(st["detection"]["reason"], "osascript failed");
+    // A later successful read makes it current again.
+    s.color.set_displays(Ok(vec![display(2, [0.0, 0.0, 100.0, 100.0], p3())]));
+    assert_eq!(status(&mut s)["detection"]["state"], "found");
     // Without displays read before, the failure is the reason.
     let mut fresh = Session::new();
     assert_eq!(fresh.color.set_displays(Err("osascript failed".into())), None);

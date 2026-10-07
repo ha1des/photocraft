@@ -164,6 +164,8 @@ pub enum MonitorDetection {
     Failed { reason: String },
     /// [`ColorState::displays`] holds what it read.
     Found,
+    /// [`ColorState::displays`] holds an earlier reading: the last re-read failed.
+    Retained { reason: String },
 }
 
 /// A display as the platform reports it.
@@ -276,7 +278,8 @@ impl ColorState {
     }
 
     /// Record the platform's reading of the displays (`auto`). An error keeps displays read
-    /// before (a failed re-read shouldn't undo a good one) and is returned for the log instead.
+    /// before (a failed re-read shouldn't undo a good one): the detection is then
+    /// [`MonitorDetection::Retained`], and the reason is also returned for the log.
     pub fn set_displays(&mut self, r: std::result::Result<Vec<Display>, String>) -> Option<String> {
         let reason = match r {
             Ok(d) if !d.is_empty() => {
@@ -291,6 +294,7 @@ impl ColorState {
             self.monitor_detection = MonitorDetection::Failed { reason };
             None
         } else {
+            self.monitor_detection = MonitorDetection::Retained { reason: reason.clone() };
             Some(reason)
         }
     }

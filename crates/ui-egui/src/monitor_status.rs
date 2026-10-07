@@ -4,10 +4,15 @@
 //! says when the canvas falls back to sRGB, and gives Help › System Info its lines.
 //!
 //! A re-read is started when the app comes back to the front (a profile changed in System
-//! Settings or by a calibration tool meanwhile), when a window is on no known display or the
+//! Settings or by a calibration tool meanwhile), when any window is on no known display or the
 //! display it is on doesn't have the size the reading said (a display connected, removed,
-//! rearranged or set to another resolution). At most one read runs at a time, at most one starts
-//! every [`REREAD_SECS`].
+//! rearranged or set to another resolution), and when Edit › Color Settings opens. At most one
+//! read runs at a time; the automatic triggers start at most one every [`REREAD_SECS`] (a
+//! trigger inside that window is deferred, not dropped).
+//!
+//! There is deliberately no periodic re-read (#569 decision): a read costs about 0.2 s of CPU,
+//! and a profile reassigned while PhotoCraft stays in front with no window moving practically
+//! doesn't happen; it is picked up at the next return to the front or Color Settings.
 
 use std::sync::mpsc::Receiver;
 
@@ -24,8 +29,8 @@ pub type ReadDisplaysFn = std::sync::Arc<dyn Fn() -> Option<Receiver<Detection>>
 /// Notice title when a display's profile can't be used.
 pub const FALLBACK_TITLE: &str = "Display profile not used";
 
-/// Minimum time between two readings started by the triggers above.
-pub const REREAD_SECS: f64 = 5.0;
+/// Minimum time between two readings started by the automatic triggers above.
+pub const REREAD_SECS: f64 = 30.0;
 
 /// The shell's reading state (`PhotocraftApp::monitors`).
 #[derive(Default)]
@@ -33,6 +38,8 @@ pub struct State {
     pending: Option<Receiver<Detection>>,
     /// Another reading is wanted once the pending one is done or the interval has passed.
     again: bool,
+    /// A reading is wanted at once (ignores the interval).
+    now: bool,
     /// When the last reading started (egui time).
     started: Option<f64>,
     focused: Option<bool>,
@@ -76,22 +83,58 @@ pub fn poll(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let focused = ctx.input(|i| i.focused);
     let regained = focused && app.monitors.focused == Some(false);
     app.monitors.focused = Some(focused);
-    if regained || displays_changed(app, ctx) {
+    if regained {
         app.monitors.again = true;
     }
-    if app.monitors.again && app.monitors.pending.is_none() {
+    check_window(app, ctx);
+    if (app.monitors.again || app.monitors.now) && app.monitors.pending.is_none() {
         let now = ctx.input(|i| i.time);
-        let wait = app.monitors.started.map_or(0.0, |t| t + REREAD_SECS - now);
+        let wait = if app.monitors.now { 0.0 } else { app.monitors.started.map_or(0.0, |t| t + REREAD_SECS - now) };
         if wait <= 0.0 {
             start(app, now);
+            // The reader doesn't wake the UI: keep frames coming until its result is in.
+            if app.monitors.pending.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
         } else {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
     }
 }
 
+/// Is the window `ctx` draws on no known display, or on one whose size changed? Then read the
+/// displays again (called for the main window and every document window).
+pub fn check_window(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    if displays_changed(app, ctx) {
+        app.monitors.again = true;
+    }
+}
+
+/// Read the displays at the next frame regardless of the interval (a user action that shows
+/// the result: opening Color Settings).
+pub fn read_now(app: &mut PhotocraftApp) {
+    app.monitors.now = true;
+}
+
+/// The Color Settings dialog's line: the monitor profile in use for the main window, as it is
+/// now (the dialog asks again each time it draws).
+pub fn note(app: &PhotocraftApp) -> String {
+    let st = app.session.color.monitor_status();
+    let on = st.display.as_ref().map(|d| format!(" on {d}")).unwrap_or_default();
+    format!("Monitor profile in use{on}: {}{}", st.summary(), retained(app).map(|r| format!(" ({r})")).unwrap_or_default())
+}
+
+/// When the last re-read failed and an earlier reading is shown: why.
+fn retained(app: &PhotocraftApp) -> Option<String> {
+    match &app.session.color.monitor_detection {
+        MonitorDetection::Retained { reason } => Some(format!("previous reading kept; the last re-read failed: {reason}")),
+        _ => None,
+    }
+}
+
 fn start(app: &mut PhotocraftApp, now: f64) {
     app.monitors.again = false;
+    app.monitors.now = false;
     let Some(read) = app.services.read_displays.clone() else { return };
     app.monitors.started = Some(now);
     app.monitors.pending = read();
@@ -99,7 +142,8 @@ fn start(app: &mut PhotocraftApp, now: f64) {
 
 /// Record a reading. Displays whose profile can't be used leave their windows on sRGB: say so
 /// once per display and reason (an unusable profile must not look like working colour
-/// management). Manual monitor profiles don't depend on the reading.
+/// management). Manual monitor profiles don't depend on the reading. A failed re-read keeps the
+/// previous reading and says so in the status.
 pub fn apply(app: &mut PhotocraftApp, r: Detection) {
     if let Some(e) = app.session.color.set_displays(r) {
         log::warn!("re-reading the display profiles failed: {e}; keeping the previous ones");
@@ -150,7 +194,7 @@ pub fn view_display(app: &PhotocraftApp, ctx: &egui::Context) -> Option<u32> {
 /// The window is on no display we know, or on one whose size differs from what was read.
 fn displays_changed(app: &PhotocraftApp, ctx: &egui::Context) -> bool {
     let c = &app.session.color;
-    if c.displays.is_empty() || !matches!(c.monitor_detection, MonitorDetection::Found) {
+    if c.displays.is_empty() || !matches!(c.monitor_detection, MonitorDetection::Found | MonitorDetection::Retained { .. }) {
         return false;
     }
     let Some(frame) = window_frame(ctx) else { return false };
@@ -173,13 +217,16 @@ pub fn summary_lines(app: &PhotocraftApp) -> Vec<String> {
     if c.displays.is_empty() {
         return vec![format!("Monitor profile: {}", c.monitor_status().summary())];
     }
-    c.displays
+    let mut lines: Vec<String> = c
+        .displays
         .iter()
         .map(|d| {
             let main = if c.main_display == Some(d.id) { " (main window)" } else { "" };
             format!("Monitor profile on {}{main}: {}", d.name, c.monitor_status_for(Some(d.id)).summary())
         })
-        .collect()
+        .collect();
+    lines.extend(retained(app).map(|r| format!("Display profiles: {r}")));
+    lines
 }
 
 #[cfg(test)]
@@ -205,8 +252,9 @@ mod tests {
         ]
     }
 
-    /// One frame of the main window at `pos` (points; UI zoom 1) with `focused`.
-    fn frame(app: &mut PhotocraftApp, ctx: &egui::Context, t: f64, pos: [f32; 2], monitor: [f32; 2], focused: bool) {
+    /// One frame of the main window at `pos` (points; UI zoom 1) with `focused`; returns when
+    /// egui is asked to draw the next one.
+    fn frame(app: &mut PhotocraftApp, ctx: &egui::Context, t: f64, pos: [f32; 2], monitor: [f32; 2], focused: bool) -> std::time::Duration {
         let mut input = egui::RawInput { time: Some(t), focused, ..Default::default() };
         let vp = input.viewports.entry(egui::ViewportId::ROOT).or_default();
         vp.native_pixels_per_point = Some(1.0);
@@ -215,6 +263,22 @@ mod tests {
         vp.focused = Some(focused);
         let mut out = ctx.run_ui(input, |ui| poll(app, ui.ctx()));
         out.textures_delta.clear();
+        out.viewport_output.get(&egui::ViewportId::ROOT).map_or(std::time::Duration::MAX, |v| v.repaint_delay)
+    }
+
+    /// A reader whose readings arrive only when the test sends them (on `tx`).
+    fn manual_reader(app: &mut PhotocraftApp) -> (Arc<std::sync::atomic::AtomicUsize>, std::sync::mpsc::Receiver<std::sync::mpsc::Sender<Detection>>) {
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = n.clone();
+        let (give, take) = std::sync::mpsc::channel();
+        let give = std::sync::Mutex::new(give);
+        app.services.read_displays = Some(Arc::new(move || {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = give.lock().unwrap().send(tx);
+            Some(rx)
+        }));
+        (n, take)
     }
 
     /// A reader that counts its readings and returns `displays` each time.
@@ -262,23 +326,88 @@ mod tests {
         app.session.color.set_displays(Ok(displays(p3())));
         let reads = reader(&mut app, displays(p3()));
         let count = || reads.load(std::sync::atomic::Ordering::SeqCst);
-        frame(&mut app, &ctx, 10.0, [100.0, 100.0], [1728.0, 1117.0], true);
-        assert_eq!(count(), 0, "nothing changed");
-        // Back to the front after another app had it (e.g. System Settings).
-        frame(&mut app, &ctx, 11.0, [100.0, 100.0], [1728.0, 1117.0], false);
-        frame(&mut app, &ctx, 12.0, [100.0, 100.0], [1728.0, 1117.0], true);
+        frame(&mut app, &ctx, 100.0, [100.0, 100.0], [1728.0, 1117.0], true);
+        assert_eq!(count(), 0, "nothing changed: no periodic reading");
+        for t in 1..20 {
+            frame(&mut app, &ctx, 100.0 + 10.0 * f64::from(t), [100.0, 100.0], [1728.0, 1117.0], true);
+        }
+        assert_eq!(count(), 0, "still none after minutes");
+        // Back to the front after another app had it (e.g. System Settings, a calibration tool).
+        frame(&mut app, &ctx, 400.0, [100.0, 100.0], [1728.0, 1117.0], false);
+        frame(&mut app, &ctx, 401.0, [100.0, 100.0], [1728.0, 1117.0], true);
         assert_eq!(count(), 1);
-        // The display reports another size (resolution changed): wanted, but not within 5 s.
-        frame(&mut app, &ctx, 13.0, [100.0, 100.0], [1512.0, 982.0], true);
-        frame(&mut app, &ctx, 14.0, [100.0, 100.0], [1512.0, 982.0], true);
+        // Back to the front again within 30 s: deferred, not dropped.
+        frame(&mut app, &ctx, 405.0, [100.0, 100.0], [1728.0, 1117.0], false);
+        let wait = frame(&mut app, &ctx, 406.0, [100.0, 100.0], [1728.0, 1117.0], true);
         assert_eq!(count(), 1);
-        frame(&mut app, &ctx, 17.5, [100.0, 100.0], [1512.0, 982.0], true);
+        assert!(wait <= std::time::Duration::from_secs(26), "a frame is scheduled for the deferred read: {wait:?}");
+        frame(&mut app, &ctx, 431.5, [100.0, 100.0], [1728.0, 1117.0], true);
         assert_eq!(count(), 2);
-        // A window on no known display (one was connected).
+        // The display reports another size (resolution changed).
         app.monitors.started = None;
-        frame(&mut app, &ctx, 30.0, [9000.0, 100.0], [1920.0, 1080.0], true);
-        frame(&mut app, &ctx, 30.1, [9000.0, 100.0], [1920.0, 1080.0], true);
-        assert!(count() >= 3);
+        frame(&mut app, &ctx, 500.0, [100.0, 100.0], [1512.0, 982.0], true);
+        assert_eq!(count(), 3);
+        // Opening Color Settings reads at once, inside the interval.
+        crate::prefs_ui::invoke(&mut app, &ctx, "edit.colorSettings", &serde_json::json!({}));
+        frame(&mut app, &ctx, 501.0, [100.0, 100.0], [1728.0, 1117.0], true);
+        assert_eq!(count(), 4);
+    }
+
+    #[test]
+    fn a_started_reading_is_picked_up_without_input() {
+        // r1 finding 2: a reading started when the interval runs out must schedule the frame
+        // that applies its result; the reader doesn't wake the UI.
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.session.color.set_displays(Ok(displays(None)));
+        let (count, readers) = manual_reader(&mut app);
+        frame(&mut app, &ctx, 0.0, [100.0, 100.0], [1728.0, 1117.0], false);
+        let wait = frame(&mut app, &ctx, 1.0, [100.0, 100.0], [1728.0, 1117.0], true);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(wait <= std::time::Duration::from_millis(250), "next frame scheduled: {wait:?}");
+        readers.recv().unwrap().send(Ok(displays(p3()))).unwrap();
+        frame(&mut app, &ctx, 1.25, [100.0, 100.0], [1728.0, 1117.0], true);
+        assert_eq!(app.session.color.monitor().description, "Display P3");
+    }
+
+    #[test]
+    fn a_document_window_on_an_unknown_display_asks_for_a_reading() {
+        // r1 finding 1: a display connected while only a document window is on it.
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.session.color.set_displays(Ok(displays(p3())));
+        let reads = reader(&mut app, displays(p3()));
+        let mut input = egui::RawInput::default();
+        let vp = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+        vp.native_pixels_per_point = Some(1.0);
+        vp.outer_rect = Some(egui::Rect::from_min_size(egui::pos2(9000.0, 0.0), egui::vec2(800.0, 600.0)));
+        let mut out = ctx.run_ui(input, |ui| check_window(&mut app, ui.ctx()));
+        out.textures_delta.clear();
+        frame(&mut app, &ctx, 0.0, [100.0, 100.0], [1728.0, 1117.0], true);
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn color_settings_shows_the_profile_in_use_now() {
+        // r1 finding 4: the dialog's line follows a reading that arrives while it is open.
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.session.color.set_displays(Ok(displays(None)));
+        app.session.color.main_display = Some(1);
+        let d = crate::prefs_ui::invoke(&mut app, &ctx, "edit.colorSettings", &serde_json::json!({})).unwrap().unwrap()["dialog"].as_u64().unwrap();
+        let shown = |app: &PhotocraftApp| app.ui.dialogs.iter().find(|x| x.id == d).unwrap().fields["__note"].as_str().unwrap().to_string();
+        assert!(shown(&app).contains("on Built-in Retina Display: sRGB") && shown(&app).contains("fallback"), "{}", shown(&app));
+        apply(&mut app, Ok(displays(p3())));
+        app.session.color.main_display = Some(4);
+        // Drawing the dialog refreshes the line.
+        PhotocraftApp::setup_context(&ctx, Default::default());
+        let mut out = ctx.run_ui(Default::default(), |ui| crate::dialogs::show(&mut app, ui.ctx()));
+        out.textures_delta.clear();
+        assert_eq!(shown(&app), "Monitor profile in use on ROG PG32UQX: Apple_Display (auto)");
+        // A failed re-read keeps the reading and says so.
+        apply(&mut app, Err("osascript failed".into()));
+        assert!(note(&app).ends_with("(previous reading kept; the last re-read failed: osascript failed)"), "{}", note(&app));
+        assert!(summary_lines(&app).last().unwrap().contains("the last re-read failed"));
     }
 
     #[test]

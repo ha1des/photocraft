@@ -1375,8 +1375,12 @@ fn hdr_preview(app: &PhotocraftApp, doc: &photocraft_doc::Document) -> Option<[f
 /// Draw one canvas view and handle its input. `primary` = main window (tools active).
 pub fn canvas_view(app: &mut PhotocraftApp, ui: &mut egui::Ui, idx: usize, rect: Rect, mut view: View, primary: bool) -> View {
     let ctx = ui.ctx().clone();
-    // The display this window is on: its monitor profile (#569).
+    // The display this window is on: its monitor profile (#569). A document window on a display
+    // the last reading didn't know asks for a new one.
     let output = crate::monitor_status::view_display(app, &ctx);
+    if !primary {
+        crate::monitor_status::check_window(app, &ctx);
+    }
     let full = rect;
     let rect = if primary { crate::rulers::content_rect(app, rect) } else { rect };
     let doc = app.session.documents()[idx].doc.clone();
