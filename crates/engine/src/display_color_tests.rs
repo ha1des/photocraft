@@ -220,6 +220,65 @@ fn monitor_profile_setting() {
 }
 
 #[test]
+fn monitor_status_says_what_is_applied() {
+    use crate::display_color::{DetectedMonitor, MonitorDetection};
+    let mut s = Session::new();
+    let status = |s: &mut Session| s.execute("edit.colorSettings", json!({})).unwrap()["monitorStatus"].clone();
+    // No platform reader: sRGB, and the reply says it's a fallback.
+    let st = status(&mut s);
+    assert_eq!((st["requested"].as_str(), st["source"].as_str()), (Some("auto"), Some("fallback")));
+    assert_eq!(st["detection"]["state"], "unsupported");
+    assert!(st["reason"].as_str().unwrap().contains("doesn't report"), "{st}");
+    s.color.monitor_detection = MonitorDetection::Pending;
+    assert!(status(&mut s)["reason"].as_str().unwrap().contains("hasn't been read"));
+    // A profile read for a named display.
+    s.color.set_detected_monitor(Ok(DetectedMonitor { display: "Studio Display".into(), icc: Builtin::DisplayP3.profile().to_bytes().to_vec() }));
+    let st = status(&mut s);
+    assert_eq!((st["source"].as_str(), st["profile"].as_str()), (Some("auto"), Some("Display P3")));
+    assert_eq!(st["detection"], json!({"state": "found", "display": "Studio Display"}));
+    assert_eq!(st["fingerprint"], format!("{:016x}", Builtin::DisplayP3.profile().content_hash()));
+    assert!(st["reason"].is_null());
+    assert_eq!(s.color.monitor_status().summary(), "Display P3 (auto for Studio Display)");
+    // Bytes that aren't a profile, a non-RGB profile and one that can't be a destination all
+    // fall back to sRGB with the reason, and nothing else changes.
+    let mut link = Builtin::Srgb.profile().clone();
+    link.class = photocraft_cms::ProfileClass::DeviceLink;
+    let link = link.with_encoded_bytes();
+    for (icc, why) in [
+        (vec![0u8; 16], "can't be read"),
+        (Builtin::SGray.profile().to_bytes().to_vec(), "not RGB"),
+        (link.to_bytes().to_vec(), "can't be used as a display profile"),
+    ] {
+        s.color.set_detected_monitor(Ok(DetectedMonitor { display: "X".into(), icc }));
+        let st = status(&mut s);
+        assert_eq!(st["source"], "fallback", "{why}");
+        assert!(st["reason"].as_str().unwrap().contains(why), "{st}");
+        assert_eq!(s.color.monitor().content_hash(), Builtin::Srgb.profile().content_hash());
+    }
+    s.color.set_detected_monitor(Err("osascript failed".into()));
+    let st = status(&mut s);
+    assert_eq!((st["source"].as_str(), st["reason"].as_str()), (Some("fallback"), Some("osascript failed")));
+    assert!(s.color.monitor_profile.is_none());
+    // A manual choice wins over the display's profile.
+    s.color.set_detected_monitor(Ok(DetectedMonitor { display: "X".into(), icc: Builtin::DisplayP3.profile().to_bytes().to_vec() }));
+    s.execute("edit.colorSettings", json!({"monitorProfile": "rec2020"})).unwrap();
+    let st = status(&mut s);
+    assert_eq!((st["requested"].as_str(), st["source"].as_str()), (Some("rec2020"), Some("manual")));
+    assert_ne!(st["profile"], "Display P3");
+}
+
+#[test]
+fn saved_monitor_profile_that_is_gone_is_reported() {
+    // Preferences load settings without validating them: a saved .icc path deleted since.
+    let mut s = Session::new();
+    s.color.settings.monitor_profile = "/nonexistent/photocraft/display.icc".into();
+    let st = s.color.monitor_status();
+    assert_eq!((st.requested.as_str(), st.source), ("/nonexistent/photocraft/display.icc", "fallback"));
+    assert!(st.reason.as_deref().unwrap_or("").contains("cannot read profile"), "{st:?}");
+    assert_eq!(s.color.monitor().content_hash(), Builtin::Srgb.profile().content_hash());
+}
+
+#[test]
 fn monitor_profile_bad_params_fail_gracefully() {
     let mut s = Session::new();
     for bad in [

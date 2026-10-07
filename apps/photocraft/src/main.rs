@@ -137,7 +137,8 @@ fn main() -> eframe::Result {
     #[cfg(target_os = "macos")]
     let _tablet = tablet::install_macos(&stylus_feed);
 
-    // Read the main display's ICC profile while the window opens (colour-managed canvas).
+    // Read the main display's ICC profile while the window opens (colour-managed canvas;
+    // `None` where the platform has no reader).
     let monitor = monitor_profile::detect_async();
     // Brush presets load in the background; the app attaches them when they arrive.
     let presets = services::presets_dir().map(photocraft_engine::preset_store::open_dir_async);
@@ -194,8 +195,19 @@ fn main() -> eframe::Result {
             app.integrated_titlebar = cfg!(target_os = "macos");
             // Long commands and file opens run as background jobs with progress and Cancel (#210).
             app.background_jobs = std::env::var_os("PHOTOCRAFT_INLINE_JOBS").is_none();
-            if let Ok(Some(icc)) = monitor.recv_timeout(std::time::Duration::from_secs(2)) {
-                app.session.color.monitor_profile = Some(std::sync::Arc::new(icc));
+            // Wait briefly so the first frames already use the display's profile; a slower
+            // reading is applied when it arrives (#569).
+            if let Some(rx) = monitor {
+                match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                    Ok(r) => photocraft_ui_egui::monitor_status::apply(&mut app, r),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        app.session.color.monitor_detection = photocraft_engine::display_color::MonitorDetection::Pending;
+                        app.services.monitor_profile = Some(rx);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        photocraft_ui_egui::monitor_status::apply(&mut app, Err("the display profile reader stopped without an answer".into()));
+                    }
+                }
             }
             // Preferences › Performance › Use Graphics Processor (and the GPU backend: `cpu`
             // composites on the CPU).

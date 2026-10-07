@@ -74,6 +74,7 @@ pub mod mask_thumbs_ui;
 pub mod menu_catalog;
 pub mod menu_nav;
 pub mod menus;
+pub mod monitor_status;
 pub mod move_mods;
 pub mod move_ui;
 pub mod new_doc_ui;
@@ -245,6 +246,9 @@ pub struct Services {
     /// `photocraft_engine::preset_store`). Attached to the session once it arrives; without
     /// one, brush presets are session-only (web, tests).
     pub preset_store: Option<std::sync::mpsc::Receiver<photocraft_engine::preset_store::Opened>>,
+    /// The display profile reading when it didn't arrive during startup (desktop macOS):
+    /// applied when it does (`monitor_status`).
+    pub monitor_profile: Option<std::sync::mpsc::Receiver<monitor_status::Detection>>,
 }
 
 pub struct PhotocraftApp {
@@ -871,6 +875,7 @@ impl eframe::App for PhotocraftApp {
         self.collect_screenshots(ctx);
         self.issue_screenshots(ctx);
         prefs_ui::tick(self, ctx);
+        monitor_status::poll(self, ctx);
         // A window bigger than its display (1440 × 900 on 1366 × 768) runs under the taskbar:
         // maximize it into the work area once (#315).
         work_area::fit_window(ctx);

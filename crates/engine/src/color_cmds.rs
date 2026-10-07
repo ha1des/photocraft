@@ -202,6 +202,9 @@ pub struct ColorState {
     /// The main display's ICC profile as read by the platform (used when Color Settings ›
     /// Monitor Profile is `auto`; `None` = sRGB display).
     pub monitor_profile: Option<Arc<Vec<u8>>>,
+    /// Where `monitor_profile` came from, or why there is none (see
+    /// [`ColorState::set_detected_monitor`]).
+    pub monitor_detection: crate::display_color::MonitorDetection,
     display_cache: Mutex<HashMap<DisplayKey, Arc<Transform>>>,
     pub(crate) display: crate::display_color::DisplayCaches,
     /// View › 32-bit Preview Options per document.
@@ -873,6 +876,7 @@ fn color_settings(s: &mut Session, p: &Value) -> Result<Value> {
         "working": {"rgb": desc(ColorMode::Rgb), "cmyk": desc(ColorMode::Cmyk), "gray": desc(ColorMode::Grayscale)},
         "monitor": s.color.monitor().description,
         "monitorDetected": s.color.monitor_profile.is_some(),
+        "monitorStatus": s.color.monitor_status(),
     }))
 }
 
@@ -955,7 +959,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "edit.colorSettings",
             "Color Settings…",
             ["Edit"],
-            r##"{"workingRgb":"srgb|display-p3|adobe-rgb-compat|prophoto-compat|linear-srgb|rec2020","workingCmyk":"coated-cmyk","workingGray":"sgray|gray-gamma-2.2","policyRgb":"preserve|convert|off","policyCmyk":"preserve|convert|off","policyGray":"preserve|convert|off","askOnMismatch":bool=true,"askOnPaste":bool=true,"askOnMissing":bool=false,"intent":"relative|perceptual|saturation|absolute","blendTextGamma":1.0..2.2|bool=1.45,"bpc":bool=true,"dither":bool=true,"monitorProfile":"auto|srgb|display-p3|adobe-rgb-compat|prophoto-compat|rec2020","reset":bool=false} (working spaces and the monitor profile also accept .icc paths; monitor `auto` = the main display's profile when the platform provides it, else sRGB)"##,
+            r##"{"workingRgb":"srgb|display-p3|adobe-rgb-compat|prophoto-compat|linear-srgb|rec2020","workingCmyk":"coated-cmyk","workingGray":"sgray|gray-gamma-2.2","policyRgb":"preserve|convert|off","policyCmyk":"preserve|convert|off","policyGray":"preserve|convert|off","askOnMismatch":bool=true,"askOnPaste":bool=true,"askOnMissing":bool=false,"intent":"relative|perceptual|saturation|absolute","blendTextGamma":1.0..2.2|bool=1.45,"bpc":bool=true,"dither":bool=true,"monitorProfile":"auto|srgb|display-p3|adobe-rgb-compat|prophoto-compat|rec2020","reset":bool=false} (working spaces and the monitor profile also accept .icc paths; monitor `auto` = the main display's profile when the platform provides it, else sRGB; the reply's `monitorStatus` says which profile is in use and why: source auto|manual|fallback, reason)"##,
             always,
             color_settings,
             true,
