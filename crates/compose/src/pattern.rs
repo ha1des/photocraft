@@ -12,6 +12,10 @@ use photocraft_doc::{ColorMode, Pattern, PixelFormat, Rect, SampleType};
 
 pub(crate) const PREPARED_PATTERN_BYTES: usize = 64 << 20;
 const MAX_PREPARED_PATTERNS: usize = 64;
+/// Absolute cap on a single pattern's RGBA conversion on the uncached path. A pattern this
+/// large cannot be cached, so re-expanding it for every output tile would be a DoS; above the
+/// cap it is skipped instead. Independent of the cache budget so small patterns still convert.
+const MAX_UNCACHED_PATTERN_BYTES: usize = 256 << 20;
 type PreparedSlot = Arc<OnceLock<Option<Arc<Tile>>>>;
 
 struct PreparedState {
@@ -45,7 +49,7 @@ impl<'a> PreparedPatterns<'a> {
 
     pub(crate) fn get(&self, id: &str, name: &str) -> Option<Arc<Tile>> {
         let p = photocraft_doc::pattern::find(self.patterns, id, name)?;
-        if p.is_empty() {
+        if !p.is_paintable() {
             return None;
         }
         let bytes = usize::try_from(p.width)
@@ -78,6 +82,13 @@ impl<'a> PreparedPatterns<'a> {
                 // Run on the requesting worker to preserve its active CMYK profile.
                 slot.get_or_init(|| Tile::new_in(p, self.mode).map(Arc::new)).clone()
             }
+            // Uncached path: a pattern whose full conversion would exceed an absolute cap is
+            // not materialized at all. Otherwise every output tile would re-expand the entire
+            // sparse pattern into RGBA floats (and could do so concurrently), exhausting CPU and
+            // memory even though cache admission already refused to retain it. The cap is
+            // independent of the (possibly zero) cache budget, so small patterns still convert
+            // on demand when nothing is cached.
+            None if bytes.is_none_or(|b| b > MAX_UNCACHED_PATTERN_BYTES) => None,
             None => Tile::new_in(p, self.mode).map(Arc::new),
         }
     }
@@ -87,9 +98,13 @@ impl<'a> PreparedPatterns<'a> {
 /// colour mode `mode`. A pattern keeps its own colours (an RGB pattern stays RGB, in the
 /// library and in the document), but in a Grayscale or CMYK document it paints that mode's
 /// colours: what Edit › Fill writes into the document's pixels, and what Photoshop shows (the
-/// pattern in colour in its picker, filled in grey).
+/// pattern in colour in its picker, filled in grey). Empty for a pattern that isn't
+/// [paintable](Pattern::is_paintable).
 pub fn pattern_rgba(p: &Pattern, mode: ColorMode) -> Vec<[f32; 4]> {
-    let mut px = vec![[0.0f32; 4]; (p.width as usize).saturating_mul(p.height as usize)];
+    let Some(n) = p.is_paintable().then(|| usize::try_from(p.pixel_count()).ok()).flatten() else {
+        return Vec::new();
+    };
+    let mut px = vec![[0.0f32; 4]; n];
     p.surface.read_rgba_into(p.rect(), &mut px);
     let paints_in = matches!(mode, ColorMode::Grayscale | ColorMode::Bitmap | ColorMode::Duotone | ColorMode::Cmyk);
     if paints_in && p.surface.format().mode != mode {
@@ -117,8 +132,9 @@ impl Tile {
     }
 
     /// The tile of `p` painted into a document of colour mode `mode` (see [`pattern_rgba`]).
+    /// `None` when the pattern isn't [paintable](Pattern::is_paintable).
     pub fn new_in(p: &Pattern, mode: ColorMode) -> Option<Tile> {
-        if p.is_empty() {
+        if !p.is_paintable() {
             return None;
         }
         let (w, h) = (p.width as usize, p.height as usize);
@@ -154,7 +170,7 @@ impl Tile {
                 if wx == 0.0 {
                     continue;
                 }
-                let p = self.at(x0 + dx, y0 + dy);
+                let p = self.at(x0.saturating_add(dx), y0.saturating_add(dy));
                 let k = wx * wy;
                 for c in 0..4 {
                     acc[c] += p[c] * k;
@@ -256,6 +272,17 @@ mod tests {
     }
 
     #[test]
+    fn patterns_too_large_to_paint_are_skipped_without_allocating() {
+        // Only the size is declared (no tiles): a hostile file can claim any size.
+        let p = Pattern { id: "big".into(), name: "Big".into(), width: 9000, height: 8000, surface: Surface::new(PixelFormat::RGBA8) };
+        assert!(!p.is_paintable());
+        assert!(Tile::new(&p).is_none());
+        assert!(pattern_rgba(&p, ColorMode::Rgb).is_empty());
+        let list = [p];
+        assert!(PreparedPatterns::new(&list, 0).get("big", "").is_none());
+    }
+
+    #[test]
     fn link_phase_scale_and_angle_move_the_origin() {
         let t = Tile::new(&checker()).unwrap();
         let linked = Placement::new(Rect::new(2, 0, 10, 10), true, (0.0, 0.0), 1.0, 0.0);
@@ -270,5 +297,15 @@ mod tests {
         let rot = Placement::new(Rect::EMPTY, false, (0.0, 0.0), 1.0, 90.0);
         let (u, v) = rot.map(1.0, 3.0);
         assert!((u - -3.0).abs() < 1e-9 && (v - 1.0).abs() < 1e-9, "{u},{v}");
+    }
+
+    #[test]
+    fn sampling_at_hostile_phases_does_not_overflow() {
+        let patterns = [checker()];
+        let prepared = PreparedPatterns::new(&patterns, PREPARED_PATTERN_BYTES);
+        let t = prepared.get(&patterns[0].id, "").unwrap();
+        for u in [1.0e30, -1.0e30, f64::INFINITY, f64::NAN] {
+            let _ = t.sample(u, u);
+        }
     }
 }

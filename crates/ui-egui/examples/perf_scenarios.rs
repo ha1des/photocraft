@@ -242,6 +242,8 @@ struct Sizes {
     big_layer: (u32, u32),
     /// Layers in the "150-layer document".
     many_layers: usize,
+    /// The full-canvas layers document (L3): size and layer count.
+    full_layers: (u32, u32, usize),
     /// The 16-bit document (15000 × 10000).
     huge16: (u32, u32),
     /// The 32-bit document with 20 layers.
@@ -252,28 +254,39 @@ struct Sizes {
     big_photo: (u32, u32),
     /// A4 at 300 ppi.
     a4: (u32, u32),
+    /// A new 10 × 5 m document at 200 ppi (3.1 GP, #4017).
+    huge_new: (u32, u32),
+    /// A huge document with one painted layer, refreshed zoomed out (#1015, #9330). The row name
+    /// leaves out the size because `--quick` uses a smaller one.
+    huge_doc: (u32, u32),
 }
 
 const FULL: Sizes = Sizes {
     layered: (5472, 3648),
     big_layer: (4243, 2828),
     many_layers: 150,
+    full_layers: (3000, 2000, 150),
     huge16: (15000, 10000),
     float32: (4000, 3000),
     ten_mp: (3872, 2592),
     big_photo: (6000, 4000),
     a4: (2480, 3508),
+    huge_new: (78_740, 39_370),
+    huge_doc: (30_000, 30_000),
 };
 
 const QUICK: Sizes = Sizes {
     layered: (1600, 1066),
     big_layer: (1200, 800),
     many_layers: 40,
+    full_layers: (800, 600, 20),
     huge16: (2400, 1600),
     float32: (1200, 900),
     ten_mp: (1200, 800),
     big_photo: (1600, 1066),
     a4: (1240, 1754),
+    huge_new: (20_000, 10_000),
+    huge_doc: (8_000, 8_000),
 };
 
 /// The layered document of #209: a background, six pixel layers with a drop shadow and a stroke,
@@ -331,6 +344,11 @@ fn many_layers_doc(w: u32, h: u32, n: usize) -> Res<(Session, u64)> {
     Ok((s, mid))
 }
 
+/// The first top-level layer of the active document, other than `except`, that `want` accepts.
+fn find_layer(s: &Session, except: u64, want: impl Fn(&photocraft_doc::Layer) -> bool) -> Option<u64> {
+    s.active()?.doc.layers.iter().find(|l| l.id.0 != except && want(l)).map(|l| l.id.0)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let quick = args.iter().any(|a| a == "--quick");
@@ -357,12 +375,14 @@ fn main() {
     // A panic in one group (a crash the scenario found) is reported against the row that was
     // running, and the other groups still run.
     type Group = fn(&mut Bench, &Sizes);
-    let groups: [(&str, Group); 5] = [
+    let groups: [(&str, Group); 7] = [
         ("layered", layered_scenarios),
         ("many layers", many_layer_scenarios),
+        ("full-canvas layers", full_canvas_layer_scenarios),
         ("bit depths", depth_scenarios),
         ("long operations", job_scenarios),
         ("algorithms", algorithm_scenarios),
+        ("huge document", huge_document_scenarios),
     ];
     let use_gpu = b.gpu.is_some();
     if let Some(wanted) = arg(&args, "--group")
@@ -468,6 +488,37 @@ fn layered_scenarios(b: &mut Bench, sz: &Sizes) {
         Ok(ms(t) + b.refresh(s, false)?)
     });
 
+    // Advanced Blending on one layer sends the whole document to the CPU compositor (#6689):
+    // opacity edits on another layer, then the knockout is cleared again.
+    let other = find_layer(&s, target, |l| matches!(l.content, photocraft_doc::LayerContent::Raster(_)) && photocraft_compose::effects::has_effects(l));
+    let adjustment = find_layer(&s, target, |l| matches!(l.content, photocraft_doc::LayerContent::Adjustment(_)));
+    match other {
+        Some(other) if exec(&mut s, "layer.layerStyle.blendingOptions", json!({"layer": other, "knockout": "shallow"})).is_ok() => {
+            let _ = b.refresh(&s, true);
+            b.time("set opacity on a layer with Advanced Blending + refresh", &mut s, reps, true, |b, s, i| {
+                let t = Instant::now();
+                exec(s, "layer.setProps", json!({"layer": target, "opacity": if i % 2 == 0 { 0.6 } else { 0.9 }}))?;
+                Ok(ms(t) + b.refresh(s, false)?)
+            });
+            let _ = exec(&mut s, "layer.layerStyle.blendingOptions", json!({"layer": other, "knockout": "none"}));
+            let _ = b.refresh(&s, true);
+        }
+        _ => b.errors.push(("set opacity on a layer with Advanced Blending + refresh".into(), "no second styled layer to knock out".into())),
+    }
+    // Hiding the Levels adjustment changes every pixel below it (#6535).
+    match adjustment {
+        Some(adj) => {
+            b.time("toggle adjustment layer visibility + refresh", &mut s, reps, true, |b, s, i| {
+                let t = Instant::now();
+                exec(s, "layer.setProps", json!({"layer": adj, "visible": i % 2 == 1}))?;
+                Ok(ms(t) + b.refresh(s, false)?)
+            });
+            let _ = exec(&mut s, "layer.setProps", json!({"layer": adj, "visible": true}));
+            let _ = exec(&mut s, "layer.select", json!({"layer": target}));
+        }
+        None => b.errors.push(("toggle adjustment layer visibility + refresh".into(), "no adjustment layer".into())),
+    }
+
     // A layer filling the canvas, with a drop shadow (#761) and without (#128): dragged, it
     // overhangs the canvas edge.
     let full = (|| -> Res<u64> {
@@ -534,6 +585,130 @@ fn layered_scenarios(b: &mut Bench, sz: &Sizes) {
         let v = ms(t) + b.refresh(s, false)?;
         exec(s, "edit.undo", json!({}))?;
         b.refresh(s, false)?;
+        Ok(v)
+    });
+}
+
+/// Layers overhaul L3: edits that redraw the whole document (a layer's opacity, hiding it) with
+/// many full-canvas layers, under the app's own GPU memory budget (Memory Usage at its default,
+/// the adapter's kind; `gpu_canvas::memory_budget`). Past what the budget holds, each one went to
+/// the CPU compositor (2.6 s at 150 layers of 6 MP on a discrete card).
+fn full_canvas_layer_scenarios(b: &mut Bench, sz: &Sizes) {
+    let opacity = "opacity of a layer among many full-canvas layers + refresh";
+    let hide = "hide a layer among many full-canvas layers + refresh";
+    let adjust = "hide the top adjustment layer among many full-canvas layers, over the GPU budget + refresh";
+    if !b.wanted(opacity) && !b.wanted(hide) && !b.wanted(adjust) {
+        return;
+    }
+    b.current = Some(opacity.to_string());
+    let (w, h, n) = sz.full_layers;
+    let mut s = Session::new();
+    let built = (|| -> Res<u64> {
+        exec(&mut s, "file.new", json!({"width": w, "height": h, "background": "white"}))?;
+        let mut mid = 0;
+        for i in 0..n as u32 {
+            exec(&mut s, "layer.new.layer", json!({"name": format!("full {i}")}))?;
+            exec(&mut s, "edit.fill", json!({"color": format!("#{:02x}{:02x}80", (i * 37) % 256, (i * 91) % 256), "opacity": 3}))?;
+            if i % 7 == 3 {
+                exec(&mut s, "layer.layerStyle.dropShadow", json!({"distance": 6, "size": 8}))?;
+            }
+            if i as usize == n / 2 {
+                mid = active_layer(&s)?;
+            }
+        }
+        Ok(mid)
+    })();
+    let mid = match built {
+        Ok(v) => v,
+        Err(e) => {
+            b.errors.push((opacity.to_string(), e));
+            return;
+        }
+    };
+    let mut app_budget = None;
+    if let (Some((g, _)), Some(st)) = (&b.gpu, s.active()) {
+        // As the app counts it (`canvas::gpu_budget`).
+        let pixels = st.memory_bytes() as u64;
+        let allowance = u64::from(photocraft_engine::prefs::Performance::default().memory_usage_mb) << 20;
+        let budget = photocraft_ui_egui::gpu_canvas::memory_budget(allowance, pixels, photocraft_ui_egui::gpu_canvas::physical_memory(), g.video_memory(), 0);
+        g.set_memory_budget(budget);
+        app_budget = Some(budget);
+    }
+    let _ = b.refresh(&s, true);
+    let reps = b.reps;
+    b.time(opacity, &mut s, reps, true, |b, s, i| {
+        let t = Instant::now();
+        exec(s, "layer.setProps", json!({"layer": mid, "opacity": if i % 2 == 0 { 0.5 } else { 1.0 }}))?;
+        Ok(ms(t) + b.refresh(s, false)?)
+    });
+    b.time(hide, &mut s, reps, true, |b, s, i| {
+        let t = Instant::now();
+        exec(s, "layer.setProps", json!({"layer": mid, "visible": i % 2 == 1}))?;
+        Ok(ms(t) + b.refresh(s, false)?)
+    });
+    // #6533: an adjustment among them, added after the rows above so their document is unchanged.
+    // It lands on top (above the active `full n-1`), #6533's "hide the top adjustment layer" case.
+    let _ = exec(&mut s, "layer.setProps", json!({"layer": mid, "visible": true}));
+    b.current = Some(adjust.to_string());
+    let adj = exec(&mut s, "layer.newAdjustmentLayer.levels", json!({"inBlack": 8, "inWhite": 245, "gamma": 1.05})).and_then(|_| active_layer(&s));
+    match adj {
+        Ok(adj) => {
+            // As #6533's repro (`performance.gpuMemoryMb = 512`): the ~3.6 GB working set no longer
+            // fits, so a full refresh takes the from-scratch CPU path on every machine.
+            if let Some((g, _)) = &b.gpu {
+                g.set_memory_budget(photocraft_ui_egui::gpu_canvas::MIN_GPU_BUDGET);
+            }
+            let _ = b.refresh(&s, true);
+            // Each run is a from-scratch CPU composite of 150 full-canvas layers. Every timed run
+            // is a hide: the layer is shown again, untimed, before each one.
+            b.time(adjust, &mut s, reps.min(5), true, |b, s, _| {
+                exec(s, "layer.setProps", json!({"layer": adj, "visible": true}))?;
+                b.refresh(s, false)?;
+                let t = Instant::now();
+                exec(s, "layer.setProps", json!({"layer": adj, "visible": false}))?;
+                Ok(ms(t) + b.refresh(s, false)?)
+            });
+        }
+        Err(e) => b.errors.push((adjust.to_string(), e)),
+    }
+    // `b.gpu` is shared with the later groups: give them back the budget they see on main.
+    if let (Some((g, _)), Some(budget)) = (&b.gpu, app_budget) {
+        g.set_memory_budget(budget);
+    }
+}
+
+/// #1015, #9330: a huge document with one painted layer, zoomed out: times only the reduced CPU
+/// composite `canvas::ensure_texture` draws when the document is too large for GPU textures.
+fn huge_document_scenarios(b: &mut Bench, sz: &Sizes) {
+    let name = "zoomed-out reduced composite of the huge document with one painted layer";
+    if !b.wanted(name) {
+        return;
+    }
+    b.current = Some(name.to_string());
+    let (w, h) = sz.huge_doc;
+    let mut s = Session::new();
+    let built = (|| -> Res<()> {
+        exec(&mut s, "file.new", json!({"width": w, "height": h, "background": "white"}))?;
+        exec(&mut s, "layer.new.layer", json!({"name": "paint"}))?;
+        exec(&mut s, "select.rect", json!({"x": w / 4, "y": h / 4, "width": w / 2, "height": h / 2}))?;
+        exec(&mut s, "edit.fill", json!({"color": "#c03020"}))?;
+        exec(&mut s, "select.deselect", json!({}))?;
+        Ok(())
+    })();
+    if let Err(e) = built {
+        b.errors.push((name.into(), e));
+        return;
+    }
+    // One run: each is a from-scratch reduced composite of the whole document.
+    b.time(name, &mut s, 1, false, |_, s, _| {
+        let doc = &s.active().ok_or("no document")?.doc;
+        let factor = w.max(h).div_ceil(photocraft_ui_egui::canvas::MAX_TEXTURE).max(1);
+        let t = Instant::now();
+        let reduced = photocraft_compose::render_reduced(doc, w / factor, h / factor);
+        let v = ms(t);
+        if reduced.px.is_empty() {
+            return Err("the reduced canvas is empty".into());
+        }
         Ok(v)
     });
 }
@@ -866,6 +1041,7 @@ fn algorithm_scenarios(b: &mut Bench, sz: &Sizes) {
         }
     }
     liquify_preview_scenario(b);
+    huge_new_scenario(b, sz);
     let cmyk = "brush dab on A4 300 ppi CMYK + refresh";
     if b.wanted(cmyk) {
         let (w, h) = sz.a4;
@@ -927,6 +1103,30 @@ fn algorithm_scenarios(b: &mut Bench, sz: &Sizes) {
             Ok(ms(t) + b.refresh_rect(s, photocraft_geom::Rect::EMPTY)?)
         });
     }
+}
+
+/// #4017: File > New at 10 × 5 m, 200 ppi (3.1 GP), and the first refresh of the canvas that
+/// draws a document too large for GPU textures (the reduced CPU canvas, `canvas::ensure_texture`).
+fn huge_new_scenario(b: &mut Bench, sz: &Sizes) {
+    let name = "new 3 GP document + first reduced canvas refresh";
+    if !b.wanted(name) {
+        return;
+    }
+    let (w, h) = sz.huge_new;
+    let reps = b.reps.min(3);
+    b.time(name, &mut Session::new(), reps, false, |_, s, _| {
+        let t = Instant::now();
+        exec(s, "file.new", json!({"width": w, "height": h, "resolution": 200, "background": "white"}))?;
+        let doc = &s.active().ok_or("no document")?.doc;
+        let factor = w.max(h).div_ceil(photocraft_ui_egui::canvas::MAX_TEXTURE).max(1);
+        let reduced = photocraft_compose::render_reduced(doc, w / factor, h / factor);
+        if reduced.px.first() != Some(&[1.0; 4]) {
+            return Err("the new document is not white".into());
+        }
+        let v = ms(t);
+        exec(s, "file.close", json!({}))?;
+        Ok(v)
+    });
 }
 
 /// A source-resolution Liquify brush update on the visible part of a 3500×2200 layer.

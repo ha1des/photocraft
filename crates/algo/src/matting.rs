@@ -35,7 +35,8 @@ pub struct RefineParams {
     pub feather: f32,
     /// 0–100.
     pub contrast: f32,
-    /// −100–100 (% of `max(radius, 4 px)`).
+    /// −100–100. 100% moves the edge by `max(radius, 4)` pixels. Values between whole
+    /// pixels blend the two neighbouring shifts, so the slider does not jump.
     pub shift_edge: f32,
 }
 
@@ -59,8 +60,18 @@ impl RefineParams {
     fn feather_sigma(&self) -> f32 {
         self.feather.max(0.0) / 2.0
     }
+    /// Signed shift in pixels, fractional. 100% is `max(radius, 4)` px, clamped to ±64.
+    fn shift_amount(&self) -> f32 {
+        let px = self.shift_edge.clamp(-100.0, 100.0) / 100.0 * self.radius.max(4.0);
+        if px.is_finite() { px.clamp(-64.0, 64.0) } else { 0.0 }
+    }
+    /// How many pixels the mask can move: the farther of the two integer radii a fractional
+    /// shift blends. Whole-pixel amounts stay exact (`ceil(4) == 4`).
     fn shift_px(&self) -> i32 {
-        (self.shift_edge.clamp(-100.0, 100.0) / 100.0 * self.radius.max(4.0)).round().clamp(-64.0, 64.0) as i32
+        let px = self.shift_amount();
+        let reach = px.abs().ceil();
+        let signed = if px.is_sign_negative() { -reach } else { reach };
+        if signed.is_finite() { signed as i32 } else { 0 }
     }
     fn uses_image(&self) -> bool {
         self.radius > 0.0
@@ -227,7 +238,7 @@ pub fn morph(src: &[f32], w: usize, h: usize, r: usize, grow: bool) -> Vec<f32> 
 mod brush;
 mod morphology;
 
-pub use brush::{EdgeBrush, EdgeStroke, MAX_SWEPT_AREA, SIZE_RANGE as BRUSH_SIZE_RANGE, swept_area};
+pub use brush::{EdgeBrush, EdgeStroke, MAX_SWEPT_AREA, SIZE_RANGE as BRUSH_SIZE_RANGE, brush_surface, painted_tiles, stroke_area, swept_area};
 
 /// Running max (or min) over a window of radius `r` (edge-clipped), van Herk / Gil–Werman:
 /// three comparisons per sample whatever the radius.
@@ -370,11 +381,52 @@ where
             *v = ((*v - 0.5) * gain + 0.5).clamp(0.0, 1.0);
         }
     }
-    let d = p.shift_px();
-    if d != 0 {
-        a = morphology(&a, w, h, d.unsigned_abs() as usize, d > 0);
+    let amount = p.shift_amount();
+    if amount.abs() >= 1.0e-4 {
+        a = shift_mask(&a, w, h, amount, morphology);
     }
     a
+}
+
+/// Grow or shrink `src` by a fractional pixel distance. Whole pixels use one morphology;
+/// the remainder blends that result with the next pixel, so 0.3 px is not the same step as 1 px.
+fn shift_mask<F>(src: &[f32], w: usize, h: usize, amount: f32, morphology: F) -> Vec<f32>
+where
+    F: Fn(&[f32], usize, usize, usize, bool) -> Vec<f32> + Copy,
+{
+    let mag = amount.abs();
+    if !mag.is_finite() || mag < 1.0e-4 {
+        return src.to_vec();
+    }
+    let grow = amount > 0.0;
+    let whole = mag.floor() as usize;
+    let frac = mag - whole as f32;
+    if frac < 1.0e-4 {
+        return morphology(src, w, h, whole, grow);
+    }
+    let lo = if whole == 0 { src.to_vec() } else { morphology(src, w, h, whole, grow) };
+    let hi = morphology(src, w, h, whole + 1, grow);
+    let n = w.saturating_mul(h);
+    if lo.len() < n || hi.len() < n || lo.len() != hi.len() {
+        return hi;
+    }
+    lo.into_iter().zip(hi).map(|(a, b)| a + (b - a) * frac).collect()
+}
+
+/// Most pixels one refine should cover. Its result is a dense [`Region`] over [`refine_area`]
+/// (about two bytes a pixel while it is assembled), so callers refuse a larger refine up front
+/// rather than allocate it: 2³⁰ pixels, a 32k × 32k selection.
+pub const MAX_REFINE_AREA: u64 = 1 << 30;
+
+/// The area [`refine_mask`] and [`refine_mask_brushed`] compute and allocate their result over:
+/// `content` grown by how far `p` can spread it, plus where `brush` adds, within `canvas`. Empty
+/// when `content` misses the canvas.
+pub fn refine_area(content: Rect, canvas: Rect, p: &RefineParams, brush: Option<&EdgeBrush>) -> Rect {
+    let content = content.intersect(&canvas);
+    if content.is_empty() {
+        return Rect::EMPTY;
+    }
+    content.inflate(p.spread()).union(&brush.map_or(Rect::EMPTY, EdgeBrush::added_bounds)).intersect(&canvas)
 }
 
 /// Refines a selection mask. `mask(r)` returns coverage over `r` (row-major); `content` bounds
@@ -410,11 +462,10 @@ fn refine_mask_with<F>(
 where
     F: Fn(&[f32], usize, usize, usize, bool) -> Vec<f32> + Copy + Sync + Send,
 {
-    let content = content.intersect(&canvas);
-    if content.is_empty() {
+    let bbox = refine_area(content, canvas, p, brush);
+    if bbox.is_empty() {
         return None;
     }
-    let bbox = content.inflate(p.spread()).union(&brush.map_or(Rect::EMPTY, EdgeBrush::added_bounds)).intersect(&canvas);
     let halo = p.halo() + brush.map_or(0, |b| i32::try_from(b.window() * 4).unwrap_or(i32::MAX));
     let mut tiles = Vec::new();
     let mut y = bbox.y0;
@@ -720,6 +771,16 @@ mod tests {
         let shrunk = refine_buffer(None, &m, w, h, &RefineParams { shift_edge: -50.0, ..Default::default() });
         assert_eq!(shrunk[5 * w + 27], 1.0);
         assert_eq!(shrunk[5 * w + 28], 0.0);
+        // Radius 0 scales 100% to 4 px, so 12.5% is half a pixel and 25% is one pixel.
+        // The pixel just outside a hard edge fades in instead of snapping on.
+        let half = refine_buffer(None, &m, w, h, &RefineParams { shift_edge: 12.5, ..Default::default() });
+        let one = refine_buffer(None, &m, w, h, &RefineParams { shift_edge: 25.0, ..Default::default() });
+        assert_eq!(m[5 * w + 30], 0.0);
+        assert!((half[5 * w + 30] - 0.5).abs() < 0.02, "half pixel {}", half[5 * w + 30]);
+        assert_eq!(one[5 * w + 30], 1.0);
+        assert_eq!(half[5 * w + 31], 0.0, "the blend must not jump a second pixel");
+        let pulled = refine_buffer(None, &m, w, h, &RefineParams { shift_edge: -12.5, ..Default::default() });
+        assert!((pulled[5 * w + 29] - 0.5).abs() < 0.02, "half-pixel contract {}", pulled[5 * w + 29]);
         let sm = refine_buffer(None, &m, w, h, &RefineParams { smooth: 50.0, ..Default::default() });
         assert!(sm[5 * w + 10] == 1.0 && sm[5 * w + 50] == 0.0);
     }
